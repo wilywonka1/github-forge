@@ -5,7 +5,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { deflateSync, createInflate } from 'node:zlib';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const ZERO_OID = '0000000000000000000000000000000000000000';
@@ -264,8 +264,8 @@ function reachableFromCommits(tips: readonly string[]): Set<string> {
   return seen;
 }
 
-/** BFS depth of every commit reachable from the wants (want commits are depth 1). */
-function commitDepths(wants: readonly string[]): Map<string, number> {
+/** BFS depth of every commit reachable from the wants (want commits are depth 1), not expanding past maxDepth. */
+function commitDepths(wants: readonly string[], maxDepth = Number.POSITIVE_INFINITY): Map<string, number> {
   const depths = new Map<string, number>();
   const queue: string[] = [];
   for (const want of wants) {
@@ -278,6 +278,7 @@ function commitDepths(wants: readonly string[]): Map<string, number> {
   while (queue.length > 0) {
     const oid = queue.shift()!;
     const depth = depths.get(oid)!;
+    if (depth >= maxDepth) continue;
     const obj = getObject(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
     for (const parent of parseCommit(obj.data).parents) {
@@ -1470,24 +1471,29 @@ function splitCommand(items: readonly PktItem[]): { head: string[]; args: string
   return { head, args };
 }
 
-/** Inflate the zlib stream starting at `offset`; returns the data and the offset just past the stream. */
-function inflateExact(buf: Buffer, offset: number): { data: Buffer; next: number } {
-  let lo = 1;
-  let hi = buf.length - offset;
-  let found = -1;
-  let result: Buffer | null = null;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      result = inflateSync(buf.subarray(offset, offset + mid));
-      found = mid;
-      hi = mid - 1;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  if (found < 0 || result === null) throw new Error('corrupt zlib stream in pack');
-  return { data: result, next: offset + found };
+/**
+ * Inflate the zlib stream starting at `offset`; returns the data and the offset just past the stream.
+ * The stream's bytesWritten counts exactly the compressed bytes the engine consumed, so one pass
+ * finds the stream's end even when more objects follow it in the buffer.
+ */
+function inflateStreamed(buf: Buffer, offset: number): Promise<{ data: Buffer; next: number }> {
+  return new Promise((resolve, reject) => {
+    const stream = createInflate();
+    const chunks: Buffer[] = [];
+    let settled = false;
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+    stream.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve({ data: Buffer.concat(chunks), next: offset + stream.bytesWritten });
+    });
+    stream.on('error', (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+    stream.end(buf.subarray(offset));
+  });
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -1536,7 +1542,7 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 }
 
 /** Parse a packfile into the objects it carries, resolving OFS/REF deltas. Throws on malformed input. */
-function parsePack(pack: Buffer): Map<string, StoredObject> {
+async function parsePack(pack: Buffer): Promise<Map<string, StoredObject>> {
   if (pack.length < 12 || pack.toString('ascii', 0, 4) !== 'PACK') throw new Error('bad pack header');
   const count = pack.readUInt32BE(8);
   let offset = 12;
@@ -1572,7 +1578,7 @@ function parsePack(pack: Buffer): Map<string, StoredObject> {
       baseOid = pack.toString('hex', offset, offset + 20);
       offset += 20;
     }
-    const inflated = inflateExact(pack, offset);
+    const inflated = await inflateStreamed(pack, offset);
     offset = inflated.next;
     if (typeCode === 6 || typeCode === 7) {
       pending.push({ start, baseOid, basePos, delta: inflated.data });
@@ -1774,7 +1780,10 @@ function handleFetchV2(repo: RepoRec, args: readonly string[]): Buffer {
     return fetchSection('acknowledgments', lines);
   }
   const haveSet = reachableFromCommits(haves);
-  const depths = commitDepths(wants);
+  // A plain shallow clone needs depths only down to its limit; deepening an existing shallow clone
+  // walks the (small) histories the checks build, so it keeps the full map.
+  const depthCap = deepen !== null && Number.isFinite(deepen) && shallowIn.length === 0 ? deepen : Number.POSITIVE_INFINITY;
+  const depths = commitDepths(wants, depthCap);
   let deliver: Set<string>;
   let shallowOut: string[] = [];
   let unshallowOut: string[] = [];
@@ -1870,7 +1879,7 @@ async function handleReceivePack(res: ServerResponse, repo: RepoRec, raw: Buffer
   let unpackOk = true;
   if (pack.length > 0) {
     try {
-      const objects = parsePack(pack);
+      const objects = await parsePack(pack);
       for (const [oid, obj] of objects) {
         if (!objectStore.has(oid)) objectStore.set(oid, obj);
       }
